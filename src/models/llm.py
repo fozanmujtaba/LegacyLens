@@ -62,10 +62,18 @@ class ModelConfig:
                    quantization=quantization, n_ctx=8192, n_batch=512)
     
     @classmethod
-    def for_llama_3_2(cls, model_path: str, quantization: QuantizationType = QuantizationType.Q4_K_M):
-        """Optimized config for Llama 3.2 3B."""
-        return cls(model_path=model_path, model_name="llama-3.2-3b",
-                   quantization=quantization, n_ctx=4096, n_batch=256, max_tokens=2048)
+    def for_qwen_coder(cls, model_path: str, quantization: QuantizationType = QuantizationType.Q4_K_M):
+        """Optimized config for Qwen2.5-Coder-7B."""
+        return cls(
+            model_path=model_path, 
+            model_name="qwen2.5-coder-7b",
+            quantization=quantization, 
+            n_ctx=8192,  # Qwen supports up to 32K but 8K is more efficient
+            n_batch=512,
+            max_tokens=4096,
+            temperature=0.1,  # Low temp for code generation
+            n_gpu_layers=-1,  # All layers on Metal
+        )
 
 
 class LegacyLensLLM:
@@ -130,7 +138,30 @@ class LegacyLensLLM:
         return self.config.n_ctx
 
 
-def load_model(model_path: str, model_type: Literal["mistral", "llama"] = "mistral") -> LegacyLensLLM:
+# Global model instance (loaded once)
+_global_model: Optional[LegacyLensLLM] = None
+
+
+def load_model(model_path: str, model_type: Literal["mistral", "llama", "qwen"] = "qwen") -> LegacyLensLLM:
     """Load a model with sensible defaults."""
-    config = ModelConfig.for_mistral_small(model_path) if model_type == "mistral" else ModelConfig.for_llama_3_2(model_path)
+    if model_type == "qwen":
+        config = ModelConfig.for_qwen_coder(model_path)
+    elif model_type == "mistral":
+        config = ModelConfig.for_mistral_small(model_path)
+    else:
+        config = ModelConfig.for_llama_3_2(model_path)
     return LegacyLensLLM(config)
+
+
+def get_model() -> Optional[LegacyLensLLM]:
+    """Get the global model instance."""
+    global _global_model
+    return _global_model
+
+
+def initialize_model(model_path: str, model_type: str = "qwen") -> LegacyLensLLM:
+    """Initialize and cache the global model."""
+    global _global_model
+    if _global_model is None:
+        _global_model = load_model(model_path, model_type)
+    return _global_model

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback } from "react";
+import { useState, useCallback, useRef, useEffect } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import Editor from "@monaco-editor/react";
 import {
@@ -8,7 +8,6 @@ import {
     Download,
     Copy,
     Check,
-    RefreshCw,
     FileCode,
     Sparkles,
     ChevronLeft,
@@ -16,6 +15,8 @@ import {
     CheckCircle2,
     Clock,
     Loader2,
+    Wifi,
+    WifiOff,
 } from "lucide-react";
 import Link from "next/link";
 
@@ -50,45 +51,7 @@ public:
     }
 };`;
 
-const SAMPLE_PYTHON = `from pathlib import Path
-from dataclasses import dataclass
-import numpy as np
-from numpy.typing import NDArray
-
-@dataclass
-class ImageProcessor:
-    """Modern Python image processor with automatic resource management."""
-    width: int
-    height: int
-    _pixel_buffer: NDArray[np.uint8] | None = None
-    
-    def __post_init__(self):
-        self._pixel_buffer = np.zeros(
-            (self.height, self.width, 3), dtype=np.uint8
-        )
-    
-    def __enter__(self):
-        return self
-    
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self._pixel_buffer = None
-        return False
-    
-    def apply_gamma(self, gamma: float) -> None:
-        """Apply gamma correction using vectorized NumPy operations."""
-        normalized = self._pixel_buffer.astype(np.float32) / 255.0
-        corrected = np.power(normalized, gamma)
-        self._pixel_buffer = (corrected * 255.0).astype(np.uint8)
-
-
-# Usage with context manager
-def main():
-    with ImageProcessor(1920, 1080) as processor:
-        processor.apply_gamma(2.2)
-
-
-if __name__ == "__main__":
-    main()`;
+const API_BASE = "http://localhost:8000";
 
 type AgentStatus = "pending" | "running" | "completed" | "failed";
 
@@ -106,6 +69,12 @@ export default function RefactorPage() {
     const [language, setLanguage] = useState<"cpp" | "java">("cpp");
     const [isProcessing, setIsProcessing] = useState(false);
     const [copied, setCopied] = useState(false);
+    const [connected, setConnected] = useState(false);
+    const [error, setError] = useState<string | null>(null);
+    const [modelLoaded, setModelLoaded] = useState(false);
+    const [useMock, setUseMock] = useState(true);
+    const wsRef = useRef<WebSocket | null>(null);
+
     const [agents, setAgents] = useState<Agent[]>([
         { id: "archaeologist", name: "Archaeologist", emoji: "🏛️", status: "pending" },
         { id: "architect", name: "Architect", emoji: "📐", status: "pending" },
@@ -114,55 +83,142 @@ export default function RefactorPage() {
         { id: "scribe", name: "Scribe", emoji: "📜", status: "pending" },
     ]);
 
+    // Check if model is loaded on mount
+    useEffect(() => {
+        const checkModelStatus = async () => {
+            try {
+                const response = await fetch(`${API_BASE}/`);
+                if (response.ok) {
+                    const data = await response.json();
+                    setModelLoaded(data.model_loaded || false);
+                    // Auto-enable real mode if model is loaded
+                    if (data.model_loaded) {
+                        setUseMock(false);
+                    }
+                }
+            } catch {
+                // Backend not running, ignore
+            }
+        };
+        checkModelStatus();
+        // Check every 30 seconds
+        const interval = setInterval(checkModelStatus, 30000);
+        return () => clearInterval(interval);
+    }, []);
+
     const resetAgents = useCallback(() => {
         setAgents((prev) =>
             prev.map((a) => ({ ...a, status: "pending" as AgentStatus, message: undefined }))
         );
+        setError(null);
+        setModernCode("");
     }, []);
 
-    const simulateRefactor = useCallback(async () => {
+    const handleRefactor = useCallback(async () => {
         setIsProcessing(true);
-        setModernCode("");
         resetAgents();
 
-        const delays = [1500, 1200, 2000, 1500, 1000];
-        const messages = [
-            "Parsed 1 class, 3 methods, 2 memory allocations",
-            "Mapped: new/delete → context manager, loop → NumPy",
-            "Generated Python module with type hints",
-            "All 5 tests passed (100% coverage)",
-            "Created README.md and Architecture.md",
-        ];
+        try {
+            // Step 1: Create the job
+            const response = await fetch(`${API_BASE}/api/refactor`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    source_code: legacyCode,
+                    language: language,
+                    file_name: `input.${language}`,
+                    use_mock: useMock,
+                }),
+            });
 
-        for (let i = 0; i < agents.length; i++) {
-            // Set current agent to running
-            setAgents((prev) =>
-                prev.map((a, idx) =>
-                    idx === i ? { ...a, status: "running" as AgentStatus } : a
-                )
-            );
+            if (!response.ok) {
+                throw new Error("Failed to create refactoring job");
+            }
 
-            await new Promise((resolve) => setTimeout(resolve, delays[i]));
+            const { job_id } = await response.json();
 
-            // Set current agent to completed
-            setAgents((prev) =>
-                prev.map((a, idx) =>
-                    idx === i
-                        ? { ...a, status: "completed" as AgentStatus, message: messages[i] }
-                        : a
-                )
-            );
+            // Step 2: Connect to WebSocket for real-time updates
+            const ws = new WebSocket(`ws://localhost:8000/api/ws/${job_id}`);
+            wsRef.current = ws;
+
+            ws.onopen = () => {
+                setConnected(true);
+                console.log("WebSocket connected");
+            };
+
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                console.log("WS message:", data);
+
+                switch (data.type) {
+                    case "agent_update":
+                        setAgents((prev) =>
+                            prev.map((a) =>
+                                a.id === data.agent_id
+                                    ? { ...a, status: data.status, message: data.message }
+                                    : a
+                            )
+                        );
+                        break;
+
+                    case "job_complete":
+                        setModernCode(data.generated_code);
+                        setIsProcessing(false);
+                        setConnected(false);
+                        ws.close();
+                        break;
+
+                    case "job_error":
+                        setError(data.error);
+                        setIsProcessing(false);
+                        setConnected(false);
+                        ws.close();
+                        break;
+                }
+            };
+
+            ws.onerror = (err) => {
+                console.error("WebSocket error:", err);
+                setError("Connection error. Is the backend server running?");
+                setIsProcessing(false);
+                setConnected(false);
+            };
+
+            ws.onclose = () => {
+                setConnected(false);
+                console.log("WebSocket closed");
+            };
+
+        } catch (err) {
+            console.error("Refactor error:", err);
+            setError(err instanceof Error ? err.message : "Unknown error occurred");
+            setIsProcessing(false);
         }
+    }, [legacyCode, language, useMock, resetAgents]);
 
-        // Show the result
-        setModernCode(SAMPLE_PYTHON);
-        setIsProcessing(false);
-    }, [agents.length, resetAgents]);
+    // Cleanup WebSocket on unmount
+    useEffect(() => {
+        return () => {
+            if (wsRef.current) {
+                wsRef.current.close();
+            }
+        };
+    }, []);
 
     const handleCopy = useCallback(() => {
         navigator.clipboard.writeText(modernCode);
         setCopied(true);
         setTimeout(() => setCopied(false), 2000);
+    }, [modernCode]);
+
+    const handleDownload = useCallback(() => {
+        const blob = new Blob([modernCode], { type: "text/plain" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = "modernized_code.py";
+        a.click();
+        URL.revokeObjectURL(url);
     }, [modernCode]);
 
     const getStatusIcon = (status: AgentStatus) => {
@@ -201,13 +257,54 @@ export default function RefactorPage() {
                     </div>
 
                     <div className="flex items-center gap-3">
+                        {/* Connection Status */}
+                        <div className="flex items-center gap-2 px-3 py-1.5 glass rounded-lg">
+                            {connected ? (
+                                <>
+                                    <Wifi className="w-4 h-4 text-green-400" />
+                                    <span className="text-xs text-green-400">Connected</span>
+                                </>
+                            ) : (
+                                <>
+                                    <WifiOff className="w-4 h-4 text-muted-foreground" />
+                                    <span className="text-xs text-muted-foreground">Disconnected</span>
+                                </>
+                            )}
+                        </div>
+
+                        {/* Mode Toggle */}
+                        <div className="flex items-center gap-1 p-1 glass rounded-lg">
+                            <button
+                                onClick={() => setUseMock(true)}
+                                className={`px-3 py-1.5 rounded-md text-sm font-medium transition-colors ${useMock
+                                    ? "bg-yellow-500/20 text-yellow-400"
+                                    : "text-muted-foreground hover:text-foreground"
+                                    }`}
+                            >
+                                Mock
+                            </button>
+                            <button
+                                onClick={() => setUseMock(false)}
+                                disabled={!modelLoaded}
+                                className={`px-3 py-1.5 rounded-md text-sm font-medium transition-colors ${!useMock
+                                    ? "bg-green-500/20 text-green-400"
+                                    : modelLoaded
+                                        ? "text-muted-foreground hover:text-foreground"
+                                        : "text-muted-foreground/50 cursor-not-allowed"
+                                    }`}
+                                title={modelLoaded ? "Use real LLM" : "Model not loaded"}
+                            >
+                                Real LLM {modelLoaded && "✓"}
+                            </button>
+                        </div>
+
                         {/* Language Selector */}
                         <div className="flex items-center gap-1 p-1 glass rounded-lg">
                             <button
                                 onClick={() => setLanguage("cpp")}
                                 className={`px-3 py-1.5 rounded-md text-sm font-medium transition-colors ${language === "cpp"
-                                        ? "bg-indigo-500/20 text-indigo-400"
-                                        : "text-muted-foreground hover:text-foreground"
+                                    ? "bg-indigo-500/20 text-indigo-400"
+                                    : "text-muted-foreground hover:text-foreground"
                                     }`}
                             >
                                 C++
@@ -215,8 +312,8 @@ export default function RefactorPage() {
                             <button
                                 onClick={() => setLanguage("java")}
                                 className={`px-3 py-1.5 rounded-md text-sm font-medium transition-colors ${language === "java"
-                                        ? "bg-indigo-500/20 text-indigo-400"
-                                        : "text-muted-foreground hover:text-foreground"
+                                    ? "bg-indigo-500/20 text-indigo-400"
+                                    : "text-muted-foreground hover:text-foreground"
                                     }`}
                             >
                                 Java
@@ -225,7 +322,7 @@ export default function RefactorPage() {
 
                         {/* Refactor Button */}
                         <button
-                            onClick={simulateRefactor}
+                            onClick={handleRefactor}
                             disabled={isProcessing || !legacyCode.trim()}
                             className="flex items-center gap-2 px-6 py-2.5 rounded-lg bg-gradient-to-r from-indigo-500 to-purple-600 text-white font-medium hover:opacity-90 transition-opacity disabled:opacity-50 disabled:cursor-not-allowed"
                         >
@@ -244,6 +341,29 @@ export default function RefactorPage() {
                     </div>
                 </div>
             </header>
+
+            {/* Error Banner */}
+            <AnimatePresence>
+                {error && (
+                    <motion.div
+                        initial={{ opacity: 0, y: -20 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        exit={{ opacity: 0, y: -20 }}
+                        className="max-w-[1800px] mx-auto px-6 pt-4"
+                    >
+                        <div className="flex items-center gap-3 p-4 rounded-xl bg-red-500/10 border border-red-500/30 text-red-400">
+                            <AlertCircle className="w-5 h-5 flex-shrink-0" />
+                            <p className="text-sm">{error}</p>
+                            <button
+                                onClick={() => setError(null)}
+                                className="ml-auto text-xs hover:underline"
+                            >
+                                Dismiss
+                            </button>
+                        </div>
+                    </motion.div>
+                )}
+            </AnimatePresence>
 
             {/* Main Content */}
             <div className="max-w-[1800px] mx-auto p-6">
@@ -311,7 +431,10 @@ export default function RefactorPage() {
                                             </>
                                         )}
                                     </button>
-                                    <button className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors">
+                                    <button
+                                        onClick={handleDownload}
+                                        className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
+                                    >
                                         <Download className="w-3 h-3" />
                                         Download
                                     </button>
@@ -338,6 +461,7 @@ export default function RefactorPage() {
                                 <div className="text-center">
                                     <Sparkles className="w-12 h-12 mx-auto mb-4 opacity-20" />
                                     <p>Click &quot;Refactor Code&quot; to generate modern Python</p>
+                                    <p className="text-xs mt-2 opacity-50">Make sure the backend server is running</p>
                                 </div>
                             </div>
                         )}
@@ -346,7 +470,15 @@ export default function RefactorPage() {
 
                 {/* Pipeline Status */}
                 <div className="mt-6 glass rounded-xl p-6">
-                    <h3 className="text-lg font-semibold mb-4">Pipeline Status</h3>
+                    <div className="flex items-center justify-between mb-4">
+                        <h3 className="text-lg font-semibold">Pipeline Status</h3>
+                        {isProcessing && (
+                            <div className="flex items-center gap-2 text-sm text-indigo-400">
+                                <Loader2 className="w-4 h-4 animate-spin" />
+                                Processing...
+                            </div>
+                        )}
+                    </div>
                     <div className="flex flex-wrap items-center gap-3">
                         {agents.map((agent, index) => (
                             <div key={agent.id} className="flex items-center gap-3">
@@ -362,10 +494,10 @@ export default function RefactorPage() {
                                                     : "rgb(39, 39, 42)",
                                     }}
                                     className={`flex items-center gap-3 px-4 py-3 rounded-xl border transition-colors ${agent.status === "running"
-                                            ? "bg-indigo-500/10 border-indigo-500"
-                                            : agent.status === "completed"
-                                                ? "bg-green-500/10 border-green-500/30"
-                                                : "bg-secondary border-border"
+                                        ? "bg-indigo-500/10 border-indigo-500 animate-pulse"
+                                        : agent.status === "completed"
+                                            ? "bg-green-500/10 border-green-500/30"
+                                            : "bg-secondary border-border"
                                         }`}
                                 >
                                     <span className="text-2xl">{agent.emoji}</span>
@@ -380,7 +512,7 @@ export default function RefactorPage() {
                                                     initial={{ opacity: 0, height: 0 }}
                                                     animate={{ opacity: 1, height: "auto" }}
                                                     exit={{ opacity: 0, height: 0 }}
-                                                    className="text-xs text-muted-foreground mt-1"
+                                                    className="text-xs text-muted-foreground mt-1 max-w-[200px]"
                                                 >
                                                     {agent.message}
                                                 </motion.p>
@@ -390,14 +522,31 @@ export default function RefactorPage() {
                                 </motion.div>
                                 {index < agents.length - 1 && (
                                     <div
-                                        className={`w-8 h-0.5 ${agents[index + 1].status !== "pending"
-                                                ? "bg-gradient-to-r from-green-500 to-indigo-500"
-                                                : "bg-border"
+                                        className={`w-8 h-0.5 transition-colors ${agents[index + 1].status !== "pending"
+                                            ? "bg-gradient-to-r from-green-500 to-indigo-500"
+                                            : "bg-border"
                                             }`}
                                     />
                                 )}
                             </div>
                         ))}
+                    </div>
+                </div>
+
+                {/* Instructions */}
+                <div className="mt-6 glass rounded-xl p-6">
+                    <h3 className="text-lg font-semibold mb-3">Getting Started</h3>
+                    <div className="grid md:grid-cols-2 gap-4 text-sm text-muted-foreground">
+                        <div>
+                            <p className="font-medium text-foreground mb-2">1. Start the Backend</p>
+                            <code className="block p-3 rounded-lg bg-secondary text-xs font-mono">
+                                source .venv/bin/activate && python server.py
+                            </code>
+                        </div>
+                        <div>
+                            <p className="font-medium text-foreground mb-2">2. Paste Your Code</p>
+                            <p>Enter your legacy C++ or Java code in the left editor, then click &quot;Refactor Code&quot;.</p>
+                        </div>
                     </div>
                 </div>
             </div>
